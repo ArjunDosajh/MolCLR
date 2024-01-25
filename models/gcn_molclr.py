@@ -142,6 +142,7 @@ class GCN(nn.Module):
         edge_attr = data.edge_attr
 
         h = self.x_embedding1(x[:,0]) + self.x_embedding2(x[:,1])
+        h_emb = self.pool(h, data.batch)
 
         for layer in range(self.num_layer):
             h = self.gnns[layer](h, edge_index, edge_attr)
@@ -155,7 +156,7 @@ class GCN(nn.Module):
         h = self.feat_lin(h)
         out = self.out_lin(h)
 
-        return h, out
+        return h, h_emb
 
 
 if __name__ == "__main__":

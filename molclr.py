@@ -2,6 +2,7 @@ import os
 import shutil
 import sys
 import torch
+import wandb
 import yaml
 import numpy as np
 from datetime import datetime
@@ -12,6 +13,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from utils.nt_xent import NTXentLoss
 
+from dataset.dataset_contrastive import MoleculeDatasetWrapper
 
 apex_support = False
 try:
@@ -31,7 +33,7 @@ def _save_config_file(model_checkpoints_folder):
 
 
 class MolCLR(object):
-    def __init__(self, dataset, config):
+    def __init__(self, dataset, config, loss='TripletMarginLoss'):
         self.config = config
         self.device = self._get_device()
         
@@ -40,7 +42,9 @@ class MolCLR(object):
         self.writer = SummaryWriter(log_dir=log_dir)
 
         self.dataset = dataset
-        self.nt_xent_criterion = NTXentLoss(self.device, config['batch_size'], **config['loss'])
+        self.loss = loss
+        self.TripletMarginWithDistanceLoss = torch.nn.TripletMarginWithDistanceLoss(margin=1.0, distance_function=lambda x, y: 1.0 - F.cosine_similarity(x, y))
+        # self.nt_xent_criterion = NTXentLoss(self.device, config['batch_size'], **config['loss'])
 
     def _get_device(self):
         if torch.cuda.is_available() and self.config['gpu'] != 'cpu':
@@ -52,21 +56,34 @@ class MolCLR(object):
 
         return device
 
-    def _step(self, model, xis, xjs, n_iter):
-        # get the representations and the projections
-        ris, zis = model(xis)  # [N,C]
+    # def _step(self, model, xis, xjs, n_iter):
+    def _step(self, model, anchor, positive, negative, n_iter):
+        # # get the representations and the projections
+        # ris, zis = model(xis)  # [N,C]
 
-        # get the representations and the projections
-        rjs, zjs = model(xjs)  # [N,C]
+        # # get the representations and the projections
+        # rjs, zjs = model(xjs)  # [N,C]
 
-        # normalize projection feature vectors
-        zis = F.normalize(zis, dim=1)
-        zjs = F.normalize(zjs, dim=1)
+        # # normalize projection feature vectors
+        # zis = F.normalize(zis, dim=1)
+        # zjs = F.normalize(zjs, dim=1)
 
-        loss = self.nt_xent_criterion(zis, zjs)
+        # loss = self.nt_xent_criterion(zis, zjs)
+        # return loss
+
+        anchor_embedding = model(anchor)
+        positive_embedding = model(positive)
+        negative_embedding = model(negative)
+
+        if self.loss == 'TripletMarginLoss':
+            loss = F.triplet_margin_loss(anchor_embedding, positive_embedding, negative_embedding)
+        elif self.loss == 'TripletMarginWithDistanceLoss':
+            loss = self.TripletMarginWithDistanceLoss(anchor_embedding, positive_embedding, negative_embedding)
+
         return loss
 
     def train(self):
+        wandb.init(project="USPTO50_Contrastive_GCN", name="gcn_triplet_cosine_distance_no_finetune", config=self.config)
         train_loader, valid_loader = self.dataset.get_data_loaders()
 
         if self.config['model_type'] == 'gin':
@@ -100,23 +117,32 @@ class MolCLR(object):
         # save config file
         _save_config_file(model_checkpoints_folder)
 
-        n_iter = 0
-        valid_n_iter = 0
         best_valid_loss = np.inf
 
         for epoch_counter in range(self.config['epochs']):
-            for bn, (xis, xjs) in enumerate(train_loader):
+            n_iter = 0
+            valid_n_iter = 0
+            # for bn, (xis, xjs) in enumerate(train_loader):
+            for bn, (anchor, positive, negative) in enumerate(train_loader):
                 optimizer.zero_grad()
 
-                xis = xis.to(self.device)
-                xjs = xjs.to(self.device)
+                # xis = xis.to(self.device)
+                # xjs = xjs.to(self.device)
 
-                loss = self._step(model, xis, xjs, n_iter)
+                anchor = anchor.to(self.device)
+                positive = positive.to(self.device)
+                negative = negative.to(self.device)
+
+                # loss = self._step(model, xis, xjs, n_iter)
+                loss = self._step(model, anchor, positive, negative, n_iter)
 
                 if n_iter % self.config['log_every_n_steps'] == 0:
                     self.writer.add_scalar('train_loss', loss, global_step=n_iter)
                     self.writer.add_scalar('cosine_lr_decay', scheduler.get_last_lr()[0], global_step=n_iter)
-                    print(epoch_counter, bn, loss.item())
+                    # print(epoch_counter, bn, loss.item())
+                    print(f"Epoch: {epoch_counter} | Batch: {bn} | Loss: {loss.item()}")
+
+                wandb.log({"epoch": epoch_counter, "train_loss": loss.item()})
 
                 if apex_support and self.config['fp16_precision']:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -130,7 +156,9 @@ class MolCLR(object):
             # validate the model if requested
             if epoch_counter % self.config['eval_every_n_epochs'] == 0:
                 valid_loss = self._validate(model, valid_loader)
-                print(epoch_counter, bn, valid_loss, '(validation)')
+                # print(epoch_counter, bn, valid_loss, '(validation)')
+                print(f"VALIDATION | Epoch: {epoch_counter} | Batch: {bn} | Loss: {valid_loss}")
+                wandb.log({"epoch": epoch_counter, "val_loss": valid_loss})
                 if valid_loss < best_valid_loss:
                     # save the model weights
                     best_valid_loss = valid_loss
@@ -148,10 +176,12 @@ class MolCLR(object):
 
     def _load_pre_trained_weights(self, model):
         try:
-            checkpoints_folder = os.path.join('./ckpt', self.config['load_model'], 'checkpoints')
-            state_dict = torch.load(os.path.join(checkpoints_folder, 'model.pth'))
-            model.load_state_dict(state_dict)
-            print("Loaded pre-trained model with success.")
+            # checkpoints_folder = os.path.join('./ckpt', self.config['load_model'], 'checkpoints')
+            # state_dict = torch.load(os.path.join(checkpoints_folder, 'model.pth'))
+            # model.load_state_dict(state_dict)
+            # model.load_state_dict(torch.load('ckpt/pretrained_gcn/checkpoints/model.pth', map_location='cuda:0'))
+            # print("Loaded pre-trained model with success.")
+            print("Not loading any pre-trained model.")
         except FileNotFoundError:
             print("Pre-trained weights not found. Training from scratch.")
 
@@ -164,11 +194,16 @@ class MolCLR(object):
 
             valid_loss = 0.0
             counter = 0
-            for (xis, xjs) in valid_loader:
-                xis = xis.to(self.device)
-                xjs = xjs.to(self.device)
+            # for (xis, xjs) in valid_loader:
+            for bn, (anchor, positive, negative) in enumerate(valid_loader):
+                # xis = xis.to(self.device)
+                # xjs = xjs.to(self.device)
+                anchor = anchor.to(self.device)
+                positive = positive.to(self.device)
+                negative = negative.to(self.device)
 
-                loss = self._step(model, xis, xjs, counter)
+                # loss = self._step(model, xis, xjs, counter)
+                loss = self._step(model, anchor, positive, negative, counter)
                 valid_loss += loss.item()
                 counter += 1
             valid_loss /= counter
@@ -181,14 +216,14 @@ def main():
     config = yaml.load(open("config.yaml", "r"), Loader=yaml.FullLoader)
     print(config)
 
-    if config['aug'] == 'node':
-        from dataset.dataset import MoleculeDatasetWrapper
-    elif config['aug'] == 'subgraph':
-        from dataset.dataset_subgraph import MoleculeDatasetWrapper
-    elif config['aug'] == 'mix':
-        from dataset.dataset_mix import MoleculeDatasetWrapper
-    else:
-        raise ValueError('Not defined molecule augmentation!')
+    # if config['aug'] == 'node':
+    #     from dataset.dataset import MoleculeDatasetWrapper
+    # elif config['aug'] == 'subgraph':
+    #     from dataset.dataset_subgraph import MoleculeDatasetWrapper
+    # elif config['aug'] == 'mix':
+    #     from dataset.dataset_mix import MoleculeDatasetWrapper
+    # else:
+    #     raise ValueError('Not defined molecule augmentation!')
 
     dataset = MoleculeDatasetWrapper(config['batch_size'], **config['dataset'])
     molclr = MolCLR(dataset, config)
