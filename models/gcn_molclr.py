@@ -156,7 +156,7 @@ class GCN(nn.Module):
         h = self.feat_lin(h)
         out = self.out_lin(h)
 
-        return h, h_emb
+        return h
 
 
 if __name__ == "__main__":
